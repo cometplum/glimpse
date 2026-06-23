@@ -56,7 +56,7 @@ public class OcrIndexer {
             recognizer.process(image)
                     .addOnSuccessListener(text -> {
                         item.ocrText = text.getText();
-                        CategoryGuess guess = CategoryGuesser.guess(item.ocrText, item.displayName);
+                        CategoryGuess guess = CategoryGuesser.guess(item.ocrText, item);
                         item.category = guess.category;
                         item.tags = guess.tags;
                         item.confidence = guess.confidence;
@@ -68,7 +68,7 @@ public class OcrIndexer {
                     })
                     .addOnFailureListener(e -> {
                         item.ocrText = "";
-                        CategoryGuess guess = CategoryGuesser.guess("", item.displayName);
+                        CategoryGuess guess = CategoryGuesser.guess("", item);
                         item.category = guess.category;
                         item.tags = guess.tags;
                         item.confidence = guess.confidence;

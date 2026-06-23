@@ -13,9 +13,17 @@ import java.util.Locale;
 public class ScreenshotRepository extends SQLiteOpenHelper {
     private static final String DB_NAME = "glimpse.db";
     private static final int DB_VERSION = 1;
+    private static final String COLUMNS = "media_id,uri,display_name,bucket,relative_path,width,height,taken_at," +
+            "substr(ocr_text,1,260) AS ocr_text,category,tags,substr(semantic_text,1,360) AS semantic_text,confidence";
 
     public ScreenshotRepository(Context context) {
         super(context, DB_NAME, null, DB_VERSION);
+    }
+
+    @Override
+    public void onConfigure(SQLiteDatabase db) {
+        super.onConfigure(db);
+        db.enableWriteAheadLogging();
     }
 
     @Override
@@ -37,8 +45,8 @@ public class ScreenshotRepository extends SQLiteOpenHelper {
                 "updated_at INTEGER" +
                 ")");
         db.execSQL("CREATE VIRTUAL TABLE screenshot_fts USING fts4(text, title, category, tags, semantic)");
+        db.execSQL("CREATE INDEX idx_screenshots_taken_at ON screenshots(taken_at DESC)");
         db.execSQL("CREATE INDEX idx_screenshots_category ON screenshots(category)");
-        db.execSQL("CREATE INDEX idx_screenshots_taken_at ON screenshots(taken_at)");
     }
 
     @Override
@@ -50,7 +58,7 @@ public class ScreenshotRepository extends SQLiteOpenHelper {
 
     public boolean hasIndexed(long mediaId) {
         SQLiteDatabase db = getReadableDatabase();
-        try (Cursor c = db.rawQuery("SELECT media_id FROM screenshots WHERE media_id=? LIMIT 1", new String[]{String.valueOf(mediaId)})) {
+        try (Cursor c = db.rawQuery("SELECT 1 FROM screenshots WHERE media_id=? LIMIT 1", new String[]{String.valueOf(mediaId)})) {
             return c.moveToFirst();
         }
     }
@@ -64,14 +72,14 @@ public class ScreenshotRepository extends SQLiteOpenHelper {
 
     public void upsert(ScreenshotItem item) {
         SQLiteDatabase db = getWritableDatabase();
-        db.beginTransaction();
+        db.beginTransactionNonExclusive();
         try {
-            ContentValues values = new ContentValues();
+            ContentValues values = new ContentValues(14);
             values.put("media_id", item.mediaId);
             values.put("uri", item.uri.toString());
-            values.put("display_name", item.displayName);
-            values.put("bucket", item.bucket);
-            values.put("relative_path", item.relativePath);
+            values.put("display_name", safe(item.displayName));
+            values.put("bucket", safe(item.bucket));
+            values.put("relative_path", safe(item.relativePath));
             values.put("width", item.width);
             values.put("height", item.height);
             values.put("taken_at", item.takenAt);
@@ -84,7 +92,7 @@ public class ScreenshotRepository extends SQLiteOpenHelper {
             db.insertWithOnConflict("screenshots", null, values, SQLiteDatabase.CONFLICT_REPLACE);
 
             db.delete("screenshot_fts", "docid=?", new String[]{String.valueOf(item.mediaId)});
-            ContentValues fts = new ContentValues();
+            ContentValues fts = new ContentValues(6);
             fts.put("docid", item.mediaId);
             fts.put("text", safe(item.ocrText));
             fts.put("title", safe(item.displayName));
@@ -100,8 +108,8 @@ public class ScreenshotRepository extends SQLiteOpenHelper {
 
     public List<ScreenshotItem> recent(int limit) {
         SQLiteDatabase db = getReadableDatabase();
-        List<ScreenshotItem> out = new ArrayList<>();
-        try (Cursor c = db.rawQuery("SELECT * FROM screenshots ORDER BY taken_at DESC LIMIT ?", new String[]{String.valueOf(limit)})) {
+        List<ScreenshotItem> out = new ArrayList<>(Math.min(limit, 64));
+        try (Cursor c = db.rawQuery("SELECT " + COLUMNS + " FROM screenshots ORDER BY taken_at DESC LIMIT ?", new String[]{String.valueOf(limit)})) {
             while (c.moveToNext()) out.add(fromCursor(c));
         }
         return out;
@@ -112,10 +120,10 @@ public class ScreenshotRepository extends SQLiteOpenHelper {
         if (q.isEmpty()) return recent(limit);
 
         SQLiteDatabase db = getReadableDatabase();
-        List<ScreenshotItem> out = new ArrayList<>();
+        List<ScreenshotItem> out = new ArrayList<>(Math.min(limit, 64));
         String match = SemanticLite.toFtsQuery(q);
         if (!match.isEmpty()) {
-            String sql = "SELECT s.* FROM screenshot_fts f JOIN screenshots s ON s.media_id=f.docid " +
+            String sql = "SELECT " + prefixColumns() + " FROM screenshot_fts f JOIN screenshots s ON s.media_id=f.docid " +
                     "WHERE screenshot_fts MATCH ? ORDER BY s.taken_at DESC LIMIT ?";
             try (Cursor c = db.rawQuery(sql, new String[]{match, String.valueOf(limit)})) {
                 while (c.moveToNext()) out.add(fromCursor(c));
@@ -123,16 +131,21 @@ public class ScreenshotRepository extends SQLiteOpenHelper {
                 out.clear();
             }
         }
-        if (out.isEmpty()) {
+
+        if (out.isEmpty() && q.length() >= 2) {
             String like = "%" + q.toLowerCase(Locale.US) + "%";
-            String sql = "SELECT * FROM screenshots WHERE lower(ocr_text) LIKE ? OR lower(semantic_text) LIKE ? " +
-                    "OR lower(category) LIKE ? OR lower(tags) LIKE ? OR lower(display_name) LIKE ? " +
+            String sql = "SELECT " + COLUMNS + " FROM screenshots WHERE lower(tags) LIKE ? OR lower(category) LIKE ? OR lower(display_name) LIKE ? " +
                     "ORDER BY taken_at DESC LIMIT ?";
-            try (Cursor c = db.rawQuery(sql, new String[]{like, like, like, like, like, String.valueOf(limit)})) {
+            try (Cursor c = db.rawQuery(sql, new String[]{like, like, like, String.valueOf(limit)})) {
                 while (c.moveToNext()) out.add(fromCursor(c));
             }
         }
         return out;
+    }
+
+    private static String prefixColumns() {
+        return "s.media_id,s.uri,s.display_name,s.bucket,s.relative_path,s.width,s.height,s.taken_at," +
+                "substr(s.ocr_text,1,260) AS ocr_text,s.category,s.tags,substr(s.semantic_text,1,360) AS semantic_text,s.confidence";
     }
 
     private ScreenshotItem fromCursor(Cursor c) {
