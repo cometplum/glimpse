@@ -7,14 +7,16 @@ import android.database.sqlite.SQLiteDatabase;
 import android.database.sqlite.SQLiteOpenHelper;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 
 public class ScreenshotRepository extends SQLiteOpenHelper {
     private static final String DB_NAME = "glimpse.db";
     private static final int DB_VERSION = 1;
     private static final String COLUMNS = "media_id,uri,display_name,bucket,relative_path,width,height,taken_at," +
-            "substr(ocr_text,1,260) AS ocr_text,category,tags,substr(semantic_text,1,360) AS semantic_text,confidence";
+            "substr(ocr_text,1,280) AS ocr_text,category,tags,substr(semantic_text,1,420) AS semantic_text,confidence";
 
     public ScreenshotRepository(Context context) {
         super(context, DB_NAME, null, DB_VERSION);
@@ -120,32 +122,80 @@ public class ScreenshotRepository extends SQLiteOpenHelper {
         if (q.isEmpty()) return recent(limit);
 
         SQLiteDatabase db = getReadableDatabase();
-        List<ScreenshotItem> out = new ArrayList<>(Math.min(limit, 64));
+        Map<Long, ScreenshotItem> candidates = new HashMap<>(180);
+        long now = System.currentTimeMillis();
+
         String match = SemanticLite.toFtsQuery(q);
         if (!match.isEmpty()) {
             String sql = "SELECT " + prefixColumns() + " FROM screenshot_fts f JOIN screenshots s ON s.media_id=f.docid " +
-                    "WHERE screenshot_fts MATCH ? ORDER BY s.taken_at DESC LIMIT ?";
-            try (Cursor c = db.rawQuery(sql, new String[]{match, String.valueOf(limit)})) {
-                while (c.moveToNext()) out.add(fromCursor(c));
+                    "WHERE screenshot_fts MATCH ? ORDER BY s.taken_at DESC LIMIT 180";
+            try (Cursor c = db.rawQuery(sql, new String[]{match})) {
+                while (c.moveToNext()) put(candidates, fromCursor(c));
             } catch (Exception ignored) {
-                out.clear();
+                candidates.clear();
             }
         }
 
-        if (out.isEmpty() && q.length() >= 2) {
-            String like = "%" + q.toLowerCase(Locale.US) + "%";
-            String sql = "SELECT " + COLUMNS + " FROM screenshots WHERE lower(tags) LIKE ? OR lower(category) LIKE ? OR lower(display_name) LIKE ? " +
-                    "ORDER BY taken_at DESC LIMIT ?";
-            try (Cursor c = db.rawQuery(sql, new String[]{like, like, like, String.valueOf(limit)})) {
-                while (c.moveToNext()) out.add(fromCursor(c));
+        likeCandidates(db, candidates, q, 120);
+
+        if (candidates.size() < limit * 2) {
+            String sql = "SELECT " + COLUMNS + " FROM screenshots ORDER BY taken_at DESC LIMIT 360";
+            try (Cursor c = db.rawQuery(sql, null)) {
+                while (c.moveToNext()) {
+                    ScreenshotItem item = fromCursor(c);
+                    if (SearchRanker.isGoodMatch(item, q, now)) put(candidates, item);
+                }
             }
+        }
+
+        ArrayList<Scored> scored = new ArrayList<>(candidates.size());
+        for (ScreenshotItem item : candidates.values()) {
+            double score = SearchRanker.score(item, q, now);
+            if (score >= 18) scored.add(new Scored(item, score));
+        }
+        scored.sort((a, b) -> Double.compare(b.score, a.score));
+
+        List<ScreenshotItem> out = new ArrayList<>(Math.min(limit, scored.size()));
+        for (int i = 0; i < scored.size() && out.size() < limit; i++) out.add(scored.get(i).item);
+        return out;
+    }
+
+    private void likeCandidates(SQLiteDatabase db, Map<Long, ScreenshotItem> out, String query, int limit) {
+        List<String> terms = importantTerms(SemanticLite.expand(query));
+        int added = 0;
+        for (String term : terms) {
+            if (term.length() < 3 || added >= limit) continue;
+            String like = "%" + term.toLowerCase(Locale.US) + "%";
+            String sql = "SELECT " + COLUMNS + " FROM screenshots WHERE lower(tags) LIKE ? OR lower(category) LIKE ? OR lower(display_name) LIKE ? OR lower(semantic_text) LIKE ? " +
+                    "ORDER BY taken_at DESC LIMIT 40";
+            try (Cursor c = db.rawQuery(sql, new String[]{like, like, like, like})) {
+                while (c.moveToNext() && added < limit) {
+                    ScreenshotItem item = fromCursor(c);
+                    if (!out.containsKey(item.mediaId)) added++;
+                    put(out, item);
+                }
+            }
+        }
+    }
+
+    private List<String> importantTerms(String text) {
+        String[] raw = SemanticLite.normalize(text).split("[^a-z0-9₹]+", -1);
+        ArrayList<String> out = new ArrayList<>(12);
+        for (String s : raw) {
+            if (s.length() < 3 || out.contains(s)) continue;
+            out.add(s);
+            if (out.size() >= 12) break;
         }
         return out;
     }
 
+    private void put(Map<Long, ScreenshotItem> map, ScreenshotItem item) {
+        if (item != null) map.put(item.mediaId, item);
+    }
+
     private static String prefixColumns() {
         return "s.media_id,s.uri,s.display_name,s.bucket,s.relative_path,s.width,s.height,s.taken_at," +
-                "substr(s.ocr_text,1,260) AS ocr_text,s.category,s.tags,substr(s.semantic_text,1,360) AS semantic_text,s.confidence";
+                "substr(s.ocr_text,1,280) AS ocr_text,s.category,s.tags,substr(s.semantic_text,1,420) AS semantic_text,s.confidence";
     }
 
     private ScreenshotItem fromCursor(Cursor c) {
@@ -168,5 +218,11 @@ public class ScreenshotRepository extends SQLiteOpenHelper {
 
     private String safe(String s) {
         return s == null ? "" : s;
+    }
+
+    private static final class Scored {
+        final ScreenshotItem item;
+        final double score;
+        Scored(ScreenshotItem item, double score) { this.item = item; this.score = score; }
     }
 }
